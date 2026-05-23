@@ -1,7 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
+import os
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 block_cipher = None
+
+# Ensure the Analysis searches the repository root (absolute path) so local
+# packages like `shared_ascii_app` are discovered during analysis.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 hiddenimports = []
 datas = []
@@ -13,10 +18,26 @@ for package_name in ["PIL", "reportlab", "numpy"]:
     binaries += collected[1]
     hiddenimports += collected[2]
 
+# Explicitly include the local package modules that static analysis can
+# sometimes miss when imports are performed dynamically or when sys.path is
+# altered during runtime. This ensures `shared_ascii_app` is bundled.
+hiddenimports += [
+    "shared_ascii_app",
+    "shared_ascii_app.engine",
+    "shared_ascii_app.gui",
+]
+
+# Ensure all submodules of the local package are included as importable modules
+try:
+    hiddenimports += collect_submodules("shared_ascii_app")
+except Exception:
+    # If collect_submodules fails for any reason, fall back to explicit names above
+    pass
+
 
 a = Analysis(
     ["main.py"],
-    pathex=[".."],
+    pathex=[project_root],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

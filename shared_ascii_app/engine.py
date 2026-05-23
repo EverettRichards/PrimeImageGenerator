@@ -102,6 +102,12 @@ def _color_matrix_from_source(image: Image.Image, scheme: str, invert: bool) -> 
     rgb_image = image.convert("RGB")
     rgb_array = np.asarray(rgb_image, dtype=np.uint8)
 
+    # If the user requests a solid color, we don't produce a per-pixel color
+    # matrix; the renderer will instead use the configured base text color
+    # for every character.
+    if scheme_key == "solid color":
+        return None
+
     if scheme_key in {"grayscale", "grayscale (standard)", "standard"}:
         gray = np.asarray(rgb_image.convert("L"), dtype=np.uint8)
         color_matrix = np.stack([gray, gray, gray], axis=-1)
@@ -567,28 +573,87 @@ def render_char_matrix_image(
 ) -> Image.Image:
     scale = max(1, int(scale))
     num_rows, num_cols = char_matrix.shape
+    # Base font size in pixels (before scaling)
     font_size = 10
-    char_width = font_size * 0.6
-    line_height = font_size * 0.65
-    page_width = num_cols * char_width + 2 * 10
-    page_height = num_rows * line_height + 2 * 10
+    # We'll measure the font on a tiny temporary canvas to get accurate
+    # glyph metrics, then create the final image using those metrics.
+    temp_image = Image.new("RGB", (1, 1), color=bgcolor)
+    draw = ImageDraw.Draw(temp_image)
 
-    width = int(math.ceil(page_width * scale))
-    height = int(math.ceil(page_height * scale))
-    image = Image.new("RGB", (width, height), color=bgcolor)
-    draw = ImageDraw.Draw(image)
+    # Prefer a monospace font with broad Unicode coverage. Try a few common
+    # choices (DejaVu Sans Mono, Consolas, Vera) and fall back to the default
+    # Pillow font if none are available. Use the scaled font size.
+    scaled_size = max(1, int(font_size * scale))
+    font_candidates = [
+        ("DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"),
+        "DejaVuSansMono.ttf",
+        "NotoSansMono-Regular.ttf",
+        "Consolas.ttf",
+        "Vera.ttf",
+        "Courier New.ttf",
+    ]
+    font = None
+    for fname in font_candidates:
+        try:
+            font = ImageFont.truetype(fname, scaled_size)
+            break
+        except Exception:
+            font = None
 
-    try:
-        font_name = "DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"
-        font = ImageFont.truetype(font_name, font_size * scale)
-    except Exception:
+    if font is None:
         font = ImageFont.load_default()
 
     margin = 10 * scale
-    x_step = char_width * scale
-    y_step = line_height * scale
+
+    # Measure actual glyph width and vertical metrics from the chosen font so
+    # spacing is tight and consistent across platforms. Prefer measuring the
+    # digit '0' as a representative monospace glyph.
+    try:
+        # ImageDraw.textlength is available on modern Pillow; fall back to
+        # mask bbox width if needed.
+        measured_char_width = draw.textlength("0", font=font)
+    except Exception:
+        try:
+            measured_char_width = font.getmask("0").getbbox()[2]
+        except Exception:
+            measured_char_width = float(scaled_size) * 0.6
+
+    try:
+        # Use textbbox on a sample string covering ascenders/descenders to get
+        # a tight bounding box for the line height instead of relying on
+        # getmetrics which can include extra internal leading on some fonts.
+        sample = "Ay0"
+        bbox = draw.textbbox((0, 0), sample, font=font)
+        measured_line_height = bbox[3] - bbox[1]
+        # Guard against zero/very small heights
+        if measured_line_height <= 0:
+            raise Exception("invalid bbox height")
+    except Exception:
+        try:
+            ascent, descent = font.getmetrics()
+            measured_line_height = ascent + descent
+        except Exception:
+            # Conservative fallback
+            measured_line_height = float(scaled_size) * 1.0
+
+    # Steps used to advance positions. Keep gaps minimal: no extra vertical
+    # gap and only the natural horizontal advance. Apply a small negative
+    # adjustment to the measured line height (tighten by 2 pixels as requested).
+    x_step = measured_char_width
+    # subtract 2 pixels per line but ensure at least 1px height
+    y_step = max(1, measured_line_height - 2)
     y_position = margin
     stroke_width = max(1, scale // 3) if bold else 0
+
+    # Now that we have measured metrics, compute final page size and create
+    # the real image to draw into.
+    page_width = num_cols * x_step + 2 * margin
+    page_height = num_rows * y_step + 2 * margin
+
+    width = int(math.ceil(page_width))
+    height = int(math.ceil(page_height))
+    image = Image.new("RGB", (width, height), color=bgcolor)
+    draw = ImageDraw.Draw(image)
 
     base_text_color = _parse_color(textcolor) if isinstance(textcolor, str) else textcolor
     swapped_color = _parse_color(swapped_textcolor) if isinstance(swapped_textcolor, str) else swapped_textcolor
@@ -622,6 +687,7 @@ def render_char_matrix_image(
                     stroke_fill=fill,
                 )
                 x_position += x_step
+        # Move down exactly one measured line height (no extra vertical gap)
         y_position += y_step
 
     return image

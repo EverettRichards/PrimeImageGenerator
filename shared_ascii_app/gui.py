@@ -34,7 +34,7 @@ class AsciiGeneratorApp:
         self.background_color_var = tk.StringVar(value="#ffffff")
         self.text_color_var = tk.StringVar(value="#000000")
         self.grayscale_method_var = tk.StringVar(value="standard")
-        self.color_scheme_var = tk.StringVar(value="grayscale (standard)")
+        self.color_scheme_var = tk.StringVar(value="solid color")
         self.invert_colors_var = tk.BooleanVar(value=False)
         self.brightness_modifier_var = tk.StringVar(value="1.0")
         self.auto_generate_var = tk.BooleanVar(value=True)
@@ -105,6 +105,7 @@ class AsciiGeneratorApp:
             color_row,
             textvariable=self.color_scheme_var,
             values=(
+                "solid color",
                 "grayscale (standard)",
                 "full color",
                 "hue match",
