@@ -1,4 +1,4 @@
-# VADIM ASCII Images
+# Image-to-Prime Number Pipeline
 
 This project turns input images into ASCII-art style output and can optionally search for a numeric result that is probable prime. The project now has two GUI apps built on the same shared engine:
 
@@ -138,6 +138,7 @@ Generated files are written to the root `outputs/` directory.
 - If the preview seems slow, lower `Output Width`.
 - If the app cannot find your image, verify that you selected a valid file from disk.
 - The Windows executable is built on Windows only; do not expect the Linux machine to produce a working `.exe` directly.
+- In testing, output widths above 30-40 tend to become very computationally expensive for prime outputs, or above ~250 for non-prime outputs. Keep this in mind, and start out with small numbers to avoid crashing the application.
 
 ## Notebook vs GUI
 

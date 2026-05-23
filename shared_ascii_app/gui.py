@@ -3,14 +3,13 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
-from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from PIL import Image, ImageTk
 
-from .engine import GenerationSettings, generate_ascii_art, RESAMPLING_LANCZOS
+from .engine import GenerationSettings, generate_ascii_art, rerender_generation_result, RESAMPLING_LANCZOS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,21 +26,27 @@ class AsciiGeneratorApp:
         self.current_result = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.worker_running = False
+        self._auto_generate_after_id: str | None = None
+        self._pending_auto_action: str | None = None
 
         self.image_path_var = tk.StringVar(value="No image selected")
         self.sample_width_var = tk.StringVar(value="80")
         self.background_color_var = tk.StringVar(value="#ffffff")
         self.text_color_var = tk.StringVar(value="#000000")
         self.grayscale_method_var = tk.StringVar(value="standard")
+        self.color_scheme_var = tk.StringVar(value="grayscale (standard)")
+        self.invert_colors_var = tk.BooleanVar(value=False)
         self.brightness_modifier_var = tk.StringVar(value="1.0")
         self.auto_generate_var = tk.BooleanVar(value=True)
         self.bold_var = tk.BooleanVar(value=False)
+        self.highlight_deltas_var = tk.BooleanVar(value=True)
         self.save_jpg_var = tk.BooleanVar(value=True)
         self.save_pdf_var = tk.BooleanVar(value=False)
         self.save_txt_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Ready")
 
         self._build_ui()
+        self._register_auto_traces()
         self._set_preview_placeholder("Select an image to begin")
         self.root.after(100, self._poll_queue)
 
@@ -92,17 +97,38 @@ class AsciiGeneratorApp:
         )
         method_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))
 
-        ttk.Checkbutton(left, text="Auto generate", variable=self.auto_generate_var).grid(row=7, column=0, sticky="w", pady=(8, 4))
-        ttk.Checkbutton(left, text="Bold text", variable=self.bold_var).grid(row=8, column=0, sticky="w", pady=2)
+        color_row = ttk.Frame(left)
+        color_row.grid(row=7, column=0, sticky="ew", pady=4)
+        color_row.columnconfigure(1, weight=1)
+        ttk.Label(color_row, text="Color Scheme").grid(row=0, column=0, sticky="w")
+        color_box = ttk.Combobox(
+            color_row,
+            textvariable=self.color_scheme_var,
+            values=(
+                "grayscale (standard)",
+                "full color",
+                "hue match",
+                "RGB only",
+                "RYGCBM only",
+            ),
+            state="readonly",
+            width=18,
+        )
+        color_box.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+        ttk.Checkbutton(left, text="Auto generate", variable=self.auto_generate_var).grid(row=8, column=0, sticky="w", pady=(8, 4))
+        ttk.Checkbutton(left, text="Bold text", variable=self.bold_var).grid(row=9, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(left, text="Highlight delta flips", variable=self.highlight_deltas_var).grid(row=10, column=0, sticky="w", pady=2)
+        ttk.Checkbutton(left, text="Invert colors", variable=self.invert_colors_var).grid(row=11, column=0, sticky="w", pady=2)
 
         save_frame = ttk.LabelFrame(left, text="Save Options", padding=8)
-        save_frame.grid(row=9, column=0, sticky="ew", pady=(10, 4))
+        save_frame.grid(row=12, column=0, sticky="ew", pady=(10, 4))
         ttk.Checkbutton(save_frame, text="Save JPG", variable=self.save_jpg_var).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(save_frame, text="Save PDF", variable=self.save_pdf_var).grid(row=1, column=0, sticky="w")
         ttk.Checkbutton(save_frame, text="Save TXT", variable=self.save_txt_var).grid(row=2, column=0, sticky="w")
 
         button_row = ttk.Frame(left)
-        button_row.grid(row=10, column=0, sticky="ew", pady=(14, 4))
+        button_row.grid(row=13, column=0, sticky="ew", pady=(14, 4))
         button_row.columnconfigure(0, weight=1)
         button_row.columnconfigure(1, weight=1)
         button_row.columnconfigure(2, weight=1)
@@ -114,7 +140,7 @@ class AsciiGeneratorApp:
         self.clear_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
         status_row = ttk.Frame(left)
-        status_row.grid(row=11, column=0, sticky="ew", pady=(10, 0))
+        status_row.grid(row=14, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(status_row, text="Status:").grid(row=0, column=0, sticky="w")
         ttk.Label(status_row, textvariable=self.status_var, wraplength=320).grid(row=0, column=1, sticky="w", padx=(8, 0))
 
@@ -153,7 +179,7 @@ class AsciiGeneratorApp:
         self.image_path_var.set(path)
         self._log_line(f"Selected image: {path}")
         if self.auto_generate_var.get():
-            self._start_generation(prime_requested=False, auto=True)
+            self._request_auto_action("full")
 
     def _generate_nonprime(self) -> None:
         self._start_generation(prime_requested=False, auto=False)
@@ -174,16 +200,84 @@ class AsciiGeneratorApp:
             background_color=self.background_color_var.get().strip(),
             text_color=self.text_color_var.get().strip(),
             grayscale_method=self.grayscale_method_var.get().strip().lower(),
+            color_scheme=self.color_scheme_var.get().strip(),
+            invert_colors=self.invert_colors_var.get(),
             brightness_modifier=float(self.brightness_modifier_var.get()),
             enforce_primality=enforce_primality,
+            highlight_deltas=self.highlight_deltas_var.get(),
             save_pdf=self.save_pdf_var.get(),
             save_jpg=self.save_jpg_var.get(),
             save_txt=self.save_txt_var.get(),
             update_interval=15,
         )
 
-    def _start_generation(self, prime_requested: bool, auto: bool) -> None:
+    def _register_auto_traces(self) -> None:
+        generation_vars = (
+            self.sample_width_var,
+            self.grayscale_method_var,
+            self.brightness_modifier_var,
+        )
+        visual_vars = (
+            self.background_color_var,
+            self.text_color_var,
+            self.color_scheme_var,
+            self.invert_colors_var,
+            self.bold_var,
+            self.highlight_deltas_var,
+            self.save_jpg_var,
+            self.save_pdf_var,
+            self.save_txt_var,
+        )
+
+        for variable in generation_vars:
+            variable.trace_add("write", lambda *_args, kind="full": self._request_auto_action(kind))
+        for variable in visual_vars:
+            variable.trace_add("write", lambda *_args, kind="visual": self._request_auto_action(kind))
+        self.auto_generate_var.trace_add("write", lambda *_args, kind="full": self._request_auto_action(kind))
+
+    def _merge_auto_action(self, existing: str | None, new: str) -> str:
+        if existing == "full" or new == "full":
+            return "full"
+        return "visual"
+
+    def _request_auto_action(self, action_kind: str) -> None:
+        if not self.auto_generate_var.get() or not self.current_image_path:
+            return
+
+        if action_kind == "visual" and self.current_result is None:
+            action_kind = "full"
+
+        self._pending_auto_action = self._merge_auto_action(self._pending_auto_action, action_kind)
+
+        if self._auto_generate_after_id is not None:
+            self.root.after_cancel(self._auto_generate_after_id)
+            self._auto_generate_after_id = None
+
+        if not self.worker_running:
+            self._auto_generate_after_id = self.root.after(250, self._run_pending_auto_action)
+
+    def _run_pending_auto_action(self) -> None:
+        self._auto_generate_after_id = None
+        if not self._pending_auto_action or not self.current_image_path:
+            return
+
+        action_kind = self._pending_auto_action
+        self._pending_auto_action = None
+
+        if action_kind == "visual" and self.current_result is not None:
+            self._start_generation(prime_requested=self.current_result.prime_requested, auto=True, reuse_current_result=True)
+        else:
+            prime_requested = self.current_result.prime_requested if self.current_result is not None else False
+            self._start_generation(prime_requested=prime_requested, auto=True, reuse_current_result=False)
+
+    def _start_generation(
+        self,
+        prime_requested: bool,
+        auto: bool,
+        reuse_current_result: bool = False,
+    ) -> None:
         if self.worker_running:
+            self._pending_auto_action = self._merge_auto_action(self._pending_auto_action, "visual" if reuse_current_result else "full")
             self._log_line("Generation already in progress.")
             return
 
@@ -199,17 +293,23 @@ class AsciiGeneratorApp:
             messagebox.showerror("Invalid settings", str(exc))
             return
 
-        self._set_status("Generating prime image..." if prime_requested else "Generating non-prime image...")
+        self._set_status("Updating preview..." if reuse_current_result else ("Generating prime image..." if prime_requested else "Generating non-prime image..."))
         self._clear_log()
         self.worker_running = True
         self._set_buttons_enabled(False)
+        self._pending_auto_action = None
 
-        thread = threading.Thread(target=self._worker_generate, args=(settings,), daemon=True)
+        existing_result = self.current_result if reuse_current_result else None
+
+        thread = threading.Thread(target=self._worker_generate, args=(settings, existing_result), daemon=True)
         thread.start()
 
-    def _worker_generate(self, settings: GenerationSettings) -> None:
+    def _worker_generate(self, settings: GenerationSettings, existing_result) -> None:
         try:
-            result = generate_ascii_art(settings, logger=self._queue_log)
+            if existing_result is None:
+                result = generate_ascii_art(settings, logger=self._queue_log)
+            else:
+                result = rerender_generation_result(settings, existing_result, logger=self._queue_log)
             self.message_queue.put(("result", result))
         except Exception as exc:
             self.message_queue.put(("error", exc))
@@ -229,11 +329,15 @@ class AsciiGeneratorApp:
                     self._set_status(f"Done. Checks: {payload.checks}, sieve rejects: {payload.sieve_rejects}")
                     self._set_buttons_enabled(True)
                     self.worker_running = False
+                    if self._pending_auto_action:
+                        self.root.after(50, self._run_pending_auto_action)
                 elif item_type == "error":
                     self._set_status("Error")
                     self._set_buttons_enabled(True)
                     self.worker_running = False
                     messagebox.showerror("Generation failed", str(payload))
+                    if self._pending_auto_action:
+                        self.root.after(50, self._run_pending_auto_action)
         except queue.Empty:
             pass
         finally:

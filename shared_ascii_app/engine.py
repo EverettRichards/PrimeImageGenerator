@@ -48,8 +48,11 @@ class GenerationSettings:
     background_color: str = "#ffffff"
     text_color: str = "#000000"
     grayscale_method: str = "standard"
+    color_scheme: str = "grayscale (standard)"
+    invert_colors: bool = False
     brightness_modifier: float = 1.0
     enforce_primality: bool = False
+    highlight_deltas: bool = True
     save_pdf: bool = True
     save_jpg: bool = True
     save_txt: bool = True
@@ -68,6 +71,8 @@ class GenerationSettings:
 class GenerationResult:
     char_matrix: np.ndarray
     gray_matrix: np.ndarray
+    source_image: Image.Image
+    swapped_mask: np.ndarray
     preview_image: Image.Image
     output_paths: dict[str, str]
     output_base_name: str
@@ -86,6 +91,66 @@ def _apply_brightness_modifier(image: Image.Image, modifier: float) -> Image.Ima
     if modifier == 1.0:
         return image
     return ImageEnhance.Brightness(image).enhance(modifier)
+
+
+def _invert_rgb_array(array: np.ndarray) -> np.ndarray:
+    return (255 - array).clip(0, 255).astype(np.uint8)
+
+
+def _color_matrix_from_source(image: Image.Image, scheme: str, invert: bool) -> np.ndarray | None:
+    scheme_key = scheme.strip().lower()
+    rgb_image = image.convert("RGB")
+    rgb_array = np.asarray(rgb_image, dtype=np.uint8)
+
+    if scheme_key in {"grayscale", "grayscale (standard)", "standard"}:
+        gray = np.asarray(rgb_image.convert("L"), dtype=np.uint8)
+        color_matrix = np.stack([gray, gray, gray], axis=-1)
+    elif scheme_key == "full color":
+        color_matrix = rgb_array
+    elif scheme_key == "hue match":
+        hsv_image = rgb_image.convert("HSV")
+        hsv_array = np.asarray(hsv_image, dtype=np.uint8).copy()
+        hsv_array[..., 1] = 255
+        hsv_array[..., 2] = 255
+        color_matrix = np.asarray(Image.fromarray(hsv_array, mode="HSV").convert("RGB"), dtype=np.uint8)
+    elif scheme_key == "rgb only":
+        palette = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]], dtype=np.int16)
+        flat = rgb_array.reshape(-1, 3).astype(np.int16)
+        distances = ((flat[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2)
+        color_matrix = palette[distances.argmin(axis=1)].astype(np.uint8).reshape(rgb_array.shape)
+    elif scheme_key == "rygcbm only":
+        palette = np.array(
+            [
+                [255, 0, 0],
+                [255, 255, 0],
+                [0, 255, 0],
+                [0, 255, 255],
+                [0, 0, 255],
+                [255, 0, 255],
+            ],
+            dtype=np.int16,
+        )
+        flat = rgb_array.reshape(-1, 3).astype(np.int16)
+        distances = ((flat[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2)
+        color_matrix = palette[distances.argmin(axis=1)].astype(np.uint8).reshape(rgb_array.shape)
+    else:
+        color_matrix = rgb_array
+
+    if invert:
+        color_matrix = _invert_rgb_array(color_matrix)
+
+    return color_matrix
+
+
+def _resolve_render_colors(settings: GenerationSettings, source_image: Image.Image) -> tuple[tuple[int, int, int], np.ndarray | None, tuple[int, int, int]]:
+    background_rgb = _parse_color(settings.background_color)
+    if settings.invert_colors:
+        background_rgb = tuple(255 - value for value in background_rgb)
+    color_matrix = _color_matrix_from_source(source_image, settings.color_scheme, settings.invert_colors)
+    text_rgb = _parse_color(settings.text_color)
+    if settings.invert_colors:
+        text_rgb = tuple(255 - value for value in text_rgb)
+    return background_rgb, color_matrix, text_rgb
 
 
 def standard_grayscale(image: Image.Image) -> Image.Image:
@@ -493,10 +558,11 @@ def enforce_primality(
 def render_char_matrix_image(
     char_matrix: np.ndarray,
     bold: bool,
-    bgcolor: str,
-    textcolor: str,
+    bgcolor: tuple[int, int, int] | str,
+    textcolor: tuple[int, int, int] | str,
+    color_matrix: np.ndarray | None = None,
     swapped_mask: np.ndarray | None = None,
-    swapped_textcolor: str = "#ff0000",
+    swapped_textcolor: tuple[int, int, int] | str = "#ff0000",
     scale: int = 4,
 ) -> Image.Image:
     scale = max(1, int(scale))
@@ -513,7 +579,8 @@ def render_char_matrix_image(
     draw = ImageDraw.Draw(image)
 
     try:
-        font = ImageFont.truetype("DejaVuSansMono.ttf", font_size * scale)
+        font_name = "DejaVuSansMono-Bold.ttf" if bold else "DejaVuSansMono.ttf"
+        font = ImageFont.truetype(font_name, font_size * scale)
     except Exception:
         font = ImageFont.load_default()
 
@@ -521,15 +588,39 @@ def render_char_matrix_image(
     x_step = char_width * scale
     y_step = line_height * scale
     y_position = margin
+    stroke_width = max(1, scale // 3) if bold else 0
+
+    base_text_color = _parse_color(textcolor) if isinstance(textcolor, str) else textcolor
+    swapped_color = _parse_color(swapped_textcolor) if isinstance(swapped_textcolor, str) else swapped_textcolor
 
     for row in range(num_rows):
-        if swapped_mask is None:
-            draw.text((margin, y_position), "".join(char_matrix[row].tolist()), fill=textcolor, font=font)
+        if color_matrix is None and swapped_mask is None:
+            draw.text(
+                (margin, y_position),
+                "".join(char_matrix[row].tolist()),
+                fill=base_text_color,
+                font=font,
+                stroke_width=stroke_width,
+                stroke_fill=base_text_color,
+            )
         else:
             x_position = margin
             for col in range(num_cols):
-                fill = swapped_textcolor if bool(swapped_mask[row, col]) else textcolor
-                draw.text((x_position, y_position), char_matrix[row, col], fill=fill, font=font)
+                is_swapped = swapped_mask is not None and bool(swapped_mask[row, col])
+                if is_swapped:
+                    fill = swapped_color
+                elif color_matrix is not None:
+                    fill = tuple(int(value) for value in color_matrix[row, col])
+                else:
+                    fill = base_text_color
+                draw.text(
+                    (x_position, y_position),
+                    char_matrix[row, col],
+                    fill=fill,
+                    font=font,
+                    stroke_width=stroke_width,
+                    stroke_fill=fill,
+                )
                 x_position += x_step
         y_position += y_step
 
@@ -540,10 +631,11 @@ def write_pdf(
     char_matrix: np.ndarray,
     output_path: Path,
     bold: bool,
-    bgcolor: str,
-    textcolor: str,
+    bgcolor: tuple[int, int, int] | str,
+    textcolor: tuple[int, int, int] | str,
+    color_matrix: np.ndarray | None = None,
     swapped_mask: np.ndarray | None = None,
-    swapped_textcolor: str = "#ff0000",
+    swapped_textcolor: tuple[int, int, int] | str = "#ff0000",
 ) -> tuple[float, float]:
     num_rows, num_cols = char_matrix.shape
     font_size = 10
@@ -556,20 +648,30 @@ def write_pdf(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     pdf_canvas = canvas.Canvas(str(output_path), pagesize=(page_width, page_height))
-    pdf_canvas.setFillColor(bgcolor)
+    pdf_canvas.setFillColorRGB(bgcolor[0] / 255.0, bgcolor[1] / 255.0, bgcolor[2] / 255.0)
     pdf_canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
     pdf_canvas.setFont(font_name, font_size)
 
+    base_text_color = textcolor
+    swapped_color = swapped_textcolor
+
     y_position = page_height - margin
-    if swapped_mask is None:
-        pdf_canvas.setFillColor(textcolor)
+    if color_matrix is None and swapped_mask is None:
         for row in range(num_rows):
+            pdf_canvas.setFillColorRGB(base_text_color[0] / 255.0, base_text_color[1] / 255.0, base_text_color[2] / 255.0)
             pdf_canvas.drawString(margin, y_position, "".join(char_matrix[row].tolist()))
             y_position -= line_height
     else:
         for row in range(num_rows):
             for col in range(num_cols):
-                pdf_canvas.setFillColor(swapped_textcolor if bool(swapped_mask[row, col]) else textcolor)
+                is_swapped = swapped_mask is not None and bool(swapped_mask[row, col])
+                if is_swapped:
+                    pdf_canvas.setFillColorRGB(swapped_color[0] / 255.0, swapped_color[1] / 255.0, swapped_color[2] / 255.0)
+                elif color_matrix is not None:
+                    color = tuple(int(value) for value in color_matrix[row, col])
+                    pdf_canvas.setFillColorRGB(color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+                else:
+                    pdf_canvas.setFillColorRGB(base_text_color[0] / 255.0, base_text_color[1] / 255.0, base_text_color[2] / 255.0)
                 pdf_canvas.drawString(margin + col * char_width, y_position, char_matrix[row, col])
             y_position -= line_height
 
@@ -629,14 +731,18 @@ def generate_ascii_art(settings: GenerationSettings, logger: Logger | None = Non
     output_dir = Path(settings.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    render_swapped_mask = swapped_mask if (prime_requested and settings.highlight_deltas) else None
+    background_rgb, color_matrix, text_rgb = _resolve_render_colors(settings, resized)
+
     output_paths: dict[str, str] = {}
     preview_image = render_char_matrix_image(
         prime_char_matrix,
         bold=settings.bold,
-        bgcolor=settings.background_color,
-        textcolor=settings.text_color,
-        swapped_mask=swapped_mask if prime_requested else None,
-        swapped_textcolor="#ff0000",
+        bgcolor=background_rgb,
+        textcolor=text_rgb,
+        color_matrix=color_matrix,
+        swapped_mask=render_swapped_mask,
+        swapped_textcolor=(255, 0, 0),
         scale=settings.jpg_scale,
     )
 
@@ -646,10 +752,11 @@ def generate_ascii_art(settings: GenerationSettings, logger: Logger | None = Non
             prime_char_matrix,
             pdf_path,
             bold=settings.bold,
-            bgcolor=settings.background_color,
-            textcolor=settings.text_color,
-            swapped_mask=swapped_mask if prime_requested else None,
-            swapped_textcolor="#ff0000",
+            bgcolor=background_rgb,
+            textcolor=text_rgb,
+            color_matrix=color_matrix,
+            swapped_mask=render_swapped_mask,
+            swapped_textcolor=(255, 0, 0),
         )
         output_paths["pdf"] = str(pdf_path)
         emit(f"PDF saved to {pdf_path}")
@@ -672,6 +779,8 @@ def generate_ascii_art(settings: GenerationSettings, logger: Logger | None = Non
     return GenerationResult(
         char_matrix=prime_char_matrix,
         gray_matrix=gray_matrix,
+        source_image=resized,
+        swapped_mask=render_swapped_mask if render_swapped_mask is not None else np.zeros_like(prime_char_matrix, dtype=bool),
         preview_image=preview_image,
         output_paths=output_paths,
         output_base_name=output_base_name,
@@ -680,4 +789,70 @@ def generate_ascii_art(settings: GenerationSettings, logger: Logger | None = Non
         checks=int(meta.get("checks", 0)),
         sieve_rejects=int(meta.get("sieve_rejects", 0)),
         sample_size=(sample_width := settings.sample_width, sample_height),
+    )
+
+
+def rerender_generation_result(settings: GenerationSettings, result: GenerationResult, logger: Logger | None = None) -> GenerationResult:
+    emit = logger or _noop_logger
+
+    render_swapped_mask = result.swapped_mask if (result.prime_requested and settings.highlight_deltas) else None
+    background_rgb, color_matrix, text_rgb = _resolve_render_colors(settings, result.source_image)
+    output_dir = Path(settings.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_paths: dict[str, str] = {}
+    preview_image = render_char_matrix_image(
+        result.char_matrix,
+        bold=settings.bold,
+        bgcolor=background_rgb,
+        textcolor=text_rgb,
+        color_matrix=color_matrix,
+        swapped_mask=render_swapped_mask,
+        swapped_textcolor=(255, 0, 0),
+        scale=settings.jpg_scale,
+    )
+
+    if settings.save_pdf:
+        pdf_path = output_dir / f"{result.output_base_name}.pdf"
+        write_pdf(
+            result.char_matrix,
+            pdf_path,
+            bold=settings.bold,
+            bgcolor=background_rgb,
+            textcolor=text_rgb,
+            color_matrix=color_matrix,
+            swapped_mask=render_swapped_mask,
+            swapped_textcolor=(255, 0, 0),
+        )
+        output_paths["pdf"] = str(pdf_path)
+        emit(f"PDF saved to {pdf_path}")
+
+    if settings.save_jpg:
+        jpg_path = output_dir / f"{result.output_base_name}.jpg"
+        preview_image.save(jpg_path, quality=95, subsampling=0)
+        output_paths["jpg"] = str(jpg_path)
+        emit(f"JPG saved to {jpg_path}")
+
+    if settings.save_txt:
+        txt_path = output_dir / f"{result.output_base_name}.txt"
+        with txt_path.open("w", encoding="utf-8") as handle:
+            for row in range(result.char_matrix.shape[0]):
+                handle.write("".join(result.char_matrix[row].tolist()))
+                handle.write("\n")
+        output_paths["txt"] = str(txt_path)
+        emit(f"TXT saved to {txt_path}")
+
+    return GenerationResult(
+        char_matrix=result.char_matrix,
+        gray_matrix=result.gray_matrix,
+        source_image=result.source_image,
+        swapped_mask=render_swapped_mask if render_swapped_mask is not None else np.zeros_like(result.char_matrix, dtype=bool),
+        preview_image=preview_image,
+        output_paths=output_paths,
+        output_base_name=result.output_base_name,
+        prime_requested=result.prime_requested,
+        prime_found=result.prime_found,
+        checks=result.checks,
+        sieve_rejects=result.sieve_rejects,
+        sample_size=result.sample_size,
     )
